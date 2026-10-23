@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      duckdb_version: v2.0.0
+      ci_tools_version: main
+      extension_name: duckdb_cloudeval
+      extra_toolchains: rust;python3
+      reduced_ci_mode: disabled
+      exclude_archs: windows_amd64;windows_arm64;windows_amd64_mingw;linux_amd64_musl;linux_arm64_musl;wasm_mvp;wasm_eh;wasm_threads
+      build_duckdb_shell: false
+      skip_tests: true
+      enable_rust: true
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: duckdb_cloudeval-v2.0.0-extension-*
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_NOTES: |
+            Unsigned DuckDB 2.0.0 extensions using C API v2 for Linux and macOS (x86-64 and ARM64).
+
+            Start DuckDB with `duckdb -unsigned`. Run `PRAGMA platform;` and
+            install the matching release asset by its HTTPS download URL:
+
+            ```sql
+            INSTALL 'https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/duckdb_cloudeval.osx_arm64.duckdb_extension';
+            LOAD duckdb_cloudeval;
+            ```
+
+            Replace `osx_arm64` with your platform.
+        run: |
+          for platform in linux_amd64 linux_arm64 osx_amd64 osx_arm64; do
+            mv "dist/duckdb_cloudeval-v2.0.0-extension-$platform/duckdb_cloudeval.duckdb_extension" \
+              "dist/duckdb_cloudeval.$platform.duckdb_extension"
+          done
+          printf '%s\n' "$RELEASE_NOTES" > "$RUNNER_TEMP/release-notes.md"
+          flags=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" dist/*.duckdb_extension \
+            --verify-tag --title "$RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" "${flags[@]}"

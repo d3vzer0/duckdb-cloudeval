@@ -1,107 +1,115 @@
-use duckdb::{
-    Connection, Result,
-    core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
-    duckdb_entrypoint_c_api,
-    ffi::duckdb_string_t,
-    types::DuckString,
-    vscalar::{ScalarFunctionSignature, VScalar},
-    vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, arrow::WritableVector},
+use duckdb_loadable_macros::duckdb_entrypoint_c_api_v2;
+use duckdb_neo::{
+    DuckDBType, Error, Result,
+    bind_arguments::BindArgument,
+    connection::Context,
+    data_chunk::{DataChunkRef, VectorCollection},
+    extension::Extension,
+    scalar::{ScalarCallbacks, ScalarFunctionBuilder},
+    signature::{FunctionParameter, SignatureBuilder},
+    table_function::{
+        BindFunctionHandle, ExecColumnInfo, InitColumnData, TableFunctionBuilder,
+        TableFunctionCallbacks,
+    },
+    vector::{Unknown, Vector},
 };
-use std::{
-    error::Error,
-    ffi::CString,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 struct EchoScalar;
 
-impl VScalar for EchoScalar {
-    type State = ();
+impl ScalarCallbacks for EchoScalar {
+    type BindData = ();
+    type InitData = ();
 
-    fn invoke(
-        _state: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let input_vec = input.flat_vector(0);
-        let values = unsafe { input_vec.as_slice_with_len::<duckdb_string_t>(input.len()) };
-        let mut output = output.flat_vector();
+    fn exec(
+        &self,
+        _bind_data: Option<&Self::BindData>,
+        _init_data: Option<&mut Self::InitData>,
+        _context: &Context,
+        input: &mut VectorCollection,
+        output: Vector<'_, Unknown>,
+    ) -> Result<()> {
+        let input = input.get_vector_at::<String>(0)?.reader()?;
+        let mut output = output.cast::<String>()?;
+        output.set_size(input.len())?;
+        let mut writer = output.writer()?;
 
-        for (i, value) in values.iter().enumerate() {
-            if input_vec.row_is_null(i as u64) {
-                output.set_null(i);
-                continue;
-            }
-
-            let mut value = *value;
-            let s = DuckString::new(&mut value).as_str();
-            output.insert(i, format!("🐤 {s} 🦀 {s}").as_str());
+        for (i, value) in input.iter().enumerate() {
+            let value = value.map(|s| format!("🐤 {s} 🦀 {s}"));
+            writer.set(i, value.as_deref())?;
         }
         Ok(())
     }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(
-            vec![LogicalTypeId::Varchar.into()],
-            LogicalTypeId::Varchar.into(),
-        )]
-    }
-}
-
-#[repr(C)]
-struct HelloBindData {
-    name: String,
-}
-
-#[repr(C)]
-struct HelloInitData {
-    done: AtomicBool,
 }
 
 struct HelloVTab;
 
-impl VTab for HelloVTab {
-    type InitData = HelloInitData;
-    type BindData = HelloBindData;
+impl TableFunctionCallbacks for HelloVTab {
+    type BindData = String;
+    type GlobalState = AtomicBool;
+    type LocalState = ();
 
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        bind.add_result_column("column0", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        let name = bind.get_parameter(0).to_string();
-        Ok(HelloBindData { name })
+    fn bind(
+        &self,
+        context: &Context,
+        arguments: Vec<BindArgument>,
+        bind: BindFunctionHandle<'_>,
+    ) -> Result<Self::BindData> {
+        bind.add_result_column("column0", &String::logical_type(context)?)?;
+        let value = arguments[0]
+            .value
+            .as_ref()
+            .ok_or_else(|| Error::invalid_input("rusty_quack requires a constant name"))?;
+        Ok(value.get::<String>()?.unwrap_or_else(|| "NULL".to_owned()))
     }
 
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        Ok(HelloInitData {
-            done: AtomicBool::new(false),
-        })
+    fn init_global_state(
+        &self,
+        _bind_data: &Self::BindData,
+        _context: &Context,
+        _columns: InitColumnData<'_>,
+    ) -> Result<(Option<Self::GlobalState>, Option<usize>)> {
+        Ok((Some(AtomicBool::new(false)), Some(1)))
     }
 
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let init_data = func.get_init_data();
-        let bind_data = func.get_bind_data();
-        if init_data.done.swap(true, Ordering::Relaxed) {
-            output.set_len(0);
+    fn exec(
+        &self,
+        name: &Self::BindData,
+        global_state: Option<&Self::GlobalState>,
+        _local_state: Option<&mut Self::LocalState>,
+        _context: &Context,
+        mut output: DataChunkRef<'_>,
+        _columns: ExecColumnInfo<'_>,
+    ) -> Result<()> {
+        let done = global_state.ok_or_else(|| Error::internal("Missing rusty_quack scan state"))?;
+        let mut vector = output.get_vector_at_mut::<String>(0)?;
+        if done.swap(true, Ordering::Relaxed) {
+            vector.set_size(0)?;
         } else {
-            let vector = output.flat_vector(0);
-            let result = CString::new(format!("Rusty Quack {} 🐥", bind_data.name))?;
-            vector.insert(0, result);
-            output.set_len(1);
+            vector.set_size(1)?;
+            vector
+                .writer()?
+                .set(0, Some(&format!("Rusty Quack {name} 🐥")))?;
         }
         Ok(())
     }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
-    }
 }
 
-#[duckdb_entrypoint_c_api]
-pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
-    con.register_scalar_function::<EchoScalar>("rusty_echo")?;
-    con.register_table_function::<HelloVTab>("rusty_quack")?;
-
+#[duckdb_entrypoint_c_api_v2(extension_name = "duckdb_cloudeval", api_version = "v2.0.0")]
+pub fn extension_entrypoint(extension: &Extension) -> Result<()> {
+    ScalarFunctionBuilder::new(
+        "rusty_echo",
+        SignatureBuilder::new()
+            .param(FunctionParameter::new::<String>("name"))
+            .return_type(String::logical_type(extension)?),
+        EchoScalar,
+    )
+    .register(extension)?;
+    TableFunctionBuilder::new(
+        "rusty_quack",
+        SignatureBuilder::new().param(FunctionParameter::new::<String>("name")),
+        HelloVTab,
+    )
+    .register(extension)?;
     Ok(())
 }
