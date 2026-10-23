@@ -1,0 +1,14 @@
+[package]
+name = "duckdb_cloudeval"
+version = "0.0.1"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+strip = true
+
+[dependencies]
+duckdb = { version = "~1.20000.0", features = ["loadable-extension", "vscalar"] }
